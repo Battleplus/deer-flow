@@ -338,7 +338,10 @@ def _default_branch_display_name(source_title: Any, *, source_is_branch: bool = 
         while display_name.lower().startswith("branch:"):
             display_name = display_name[len("branch:") :].strip()
 
-    return display_name or None
+    if not display_name:
+        return None
+
+    return f"Branch: {display_name}"
 
 
 # ---------------------------------------------------------------------------
