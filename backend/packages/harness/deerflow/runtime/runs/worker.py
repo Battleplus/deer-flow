@@ -78,6 +78,9 @@ from deerflow.trace_context import (
     is_trace_id_from_request_header,
     resolve_deerflow_trace_id,
 )
+
+# Prevent GC from collecting delayed cleanup tasks (#4930).
+_background_cleanup_tasks: set[asyncio.Task] = set()
 from deerflow.tracing import inject_langfuse_metadata
 from deerflow.utils.messages import message_to_text
 from deerflow.workspace_changes import capture_workspace_snapshot, get_changed_output_paths, record_workspace_changes
@@ -1341,7 +1344,10 @@ async def run_agent(
             await run_manager.set_finalizing(run_id, False)
 
         await bridge.publish_end(run_id)
-        asyncio.create_task(bridge.cleanup(run_id, delay=60))
+        # Store a strong reference so GC cannot collect the delayed task (#4930).
+        _cleanup_task = asyncio.create_task(bridge.cleanup(run_id, delay=60))
+        _background_cleanup_tasks.add(_cleanup_task)
+        _cleanup_task.add_done_callback(_background_cleanup_tasks.discard)
 
         if deferred_stop_interrupt is not None:
             raise deferred_stop_interrupt
