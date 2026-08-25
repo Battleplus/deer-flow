@@ -305,6 +305,15 @@ class ToolProgressMiddleware(AgentMiddleware[AgentState]):
         runtime: Runtime,
     ) -> ToolMessage | Command:
         """Update the state machine from a tool result; queue hints if warranted."""
+        # Handle Command wrappers: extract the ToolMessage from Command.update["messages"]
+        # and process it for progress tracking.
+        if isinstance(result, Command) and result.update:
+            messages = result.update.get("messages")
+            if messages and isinstance(messages, list):
+                for msg in messages:
+                    if isinstance(msg, ToolMessage):
+                        self._update_state_from_result(msg, tool_name, runtime)
+            return result
         if not isinstance(result, ToolMessage):
             return result
         meta = _parse_tool_meta((result.additional_kwargs or {}).get(TOOL_META_KEY))

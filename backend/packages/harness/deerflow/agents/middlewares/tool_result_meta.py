@@ -298,7 +298,19 @@ def normalize_tool_message(msg: ToolMessage) -> ToolMessage:
 
 
 def normalize_tool_result(result: ToolMessage | Command) -> ToolMessage | Command:
-    """Normalize a tool result, handling Command wrappers transparently."""
+    """Normalize a tool result, handling Command wrappers transparently.
+
+    When the result is a Command, normalize each ToolMessage inside
+    Command.update["messages"] to ensure deerflow_tool_meta is attached.
+    Non-ToolMessage entries are preserved: filtering them out would drop
+    sibling Human/AI messages carried in the same Command update.
+    """
     if isinstance(result, ToolMessage):
         return normalize_tool_message(result)
+    if isinstance(result, Command) and result.update:
+        messages = result.update.get("messages")
+        if messages and isinstance(messages, list):
+            for msg in messages:
+                if isinstance(msg, ToolMessage):
+                    normalize_tool_message(msg)
     return result

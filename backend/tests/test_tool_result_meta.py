@@ -472,3 +472,51 @@ def test_numeric_keyword_word_boundary(content: str, expected_error_type: str):
     m = _meta(result)
     assert m["status"] == "error"
     assert m["error_type"] == expected_error_type, f"{content!r} → expected {expected_error_type!r}, got {m['error_type']!r}"
+
+
+# ---------------------------------------------------------------------------
+# normalize_tool_result normalizes ToolMessages inside Command wrappers
+
+
+def test_normalize_tool_result_command_with_tool_message():
+    """Command.update["messages"] containing a bare ToolMessage gets normalized."""
+    msg = _make_msg("Error: timeout occurred", status="error")
+    cmd = Command(update={"messages": [msg], "goto": "next"})
+    result = normalize_tool_result(cmd)
+    # Normalization mutates the ToolMessage in place; the Command is unchanged.
+    assert result is cmd
+    assert isinstance(result, Command)
+    inner = result.update["messages"][0]
+    assert isinstance(inner, ToolMessage)
+    assert TOOL_META_KEY in inner.additional_kwargs
+    assert inner.additional_kwargs[TOOL_META_KEY]["status"] == "error"
+
+
+def test_normalize_tool_result_command_without_messages():
+    """Command without update["messages"] is returned unchanged."""
+    cmd = Command(goto="next")
+    result = normalize_tool_result(cmd)
+    assert result is cmd
+
+
+def test_normalize_tool_result_command_with_non_tool_messages():
+    """Command with non-ToolMessage entries leaves them untouched and preserved."""
+    from langchain_core.messages import HumanMessage
+
+    human = HumanMessage(content="hello")
+    cmd = Command(update={"messages": [human]})
+    result = normalize_tool_result(cmd)
+    # Non-ToolMessage entries must not be dropped from the Command update.
+    assert result is cmd
+    assert result.update["messages"] == [human]
+
+
+def test_normalize_tool_result_command_already_stamped():
+    """Already-stamped ToolMessage inside Command is not double-stamped."""
+    existing_meta = {"status": "success", "source": "custom"}
+    msg = _make_msg("ok", kwargs={TOOL_META_KEY: existing_meta})
+    cmd = Command(update={"messages": [msg]})
+    result = normalize_tool_result(cmd)
+    inner = result.update["messages"][0]
+    # Should preserve the original meta dict, not replace it
+    assert inner.additional_kwargs[TOOL_META_KEY] is existing_meta
