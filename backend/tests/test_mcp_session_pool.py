@@ -1793,3 +1793,98 @@ async def test_mcp_tools_routed_to_source_server_with_prefix_overlap():
     routing = dict(routed)
     assert routing["web_scraper_search"] == "web_scraper", f"tool mis-routed to {routing.get('web_scraper_search')!r}, expected 'web_scraper'"
     assert routing["web_open"] == "web"
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 cancellation regression — #5007
+# ---------------------------------------------------------------------------
+
+class _SlowExitCm:
+    """Fake session CM whose __aexit__ is slow, simulating a wedged server.
+
+    This makes the eviction shutdown take real time, widening the Phase 2
+    cancellation window so a caller cancelled during eviction teardown
+    exercises the new cleanup path.
+    """
+
+    def __init__(self) -> None:
+        self.entered = False
+        self.closed = False
+
+    async def __aenter__(self):
+        self.entered = True
+        session = MagicMock()
+        session.initialize = AsyncMock()
+        return session
+
+    async def __aexit__(self, *args):
+        # Slow exit — simulates a wedged MCP server shutdown.
+        await asyncio.sleep(5.0)
+        self.closed = True
+        return False
+
+
+@pytest.mark.asyncio
+async def test_get_session_cancelled_during_eviction_teardown_does_not_leak():
+    """Cancelling get_session during Phase 2 (eviction teardown) must not
+    leak the in-flight entry or owner task.
+
+    Regression test for #5007: before the fix, _shutdown swallowed the
+    caller's CancelledError, so Phase 3 cleanup never ran and both the
+    _inflight entry and the owner task leaked permanently.
+    """
+    pool = MCPSessionPool()
+    pool.MAX_SESSIONS = 1
+    victim_cm = _SlowExitCm()
+    new_cm = _BlockingInitCm(asyncio.Event())  # new session blocks on init
+
+    cm_counter = {"n": 0}
+    cms = []
+
+    def make_cm(*a, **kw):
+        cm_counter["n"] += 1
+        if cm_counter["n"] == 1:
+            c = victim_cm
+        else:
+            c = new_cm
+        cms.append(c)
+        return c
+
+    with patch("langchain_mcp_adapters.sessions.create_session", side_effect=make_cm):
+        conn = {"transport": "stdio", "command": "x", "args": []}
+
+        # Register the victim session.
+        s1 = await pool.get_session("s", "t1", conn)
+        assert len(pool._entries) == 1
+
+        # Start a new get_session that will evict the victim in Phase 2.
+        call = asyncio.create_task(pool.get_session("s", "t2", conn))
+        # Let Phase 1 complete (in-flight record created, victim evicted).
+        await asyncio.sleep(0.01)
+        assert ("s", "t2") in pool._inflight
+
+        # Cancel while Phase 2 is awaiting the slow victim shutdown.
+        call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await call
+
+    # The in-flight entry must have been cleaned up.
+    assert ("s", "t2") not in pool._inflight, (
+        "in-flight entry leaked after Phase 2 cancellation"
+    )
+
+    # The victim's __aexit__ should eventually run (slow exit completes).
+    for _ in range(50):
+        if victim_cm.closed:
+            break
+        await asyncio.sleep(0.1)
+    assert victim_cm.closed, "victim session __aexit__ must eventually run"
+
+    # No leaked tasks.
+    current = asyncio.current_task()
+    leaked = [
+        t
+        for t in asyncio.all_tasks()
+        if t is not current and not t.done() and "_run_session" in str(t.get_coro())
+    ]
+    assert not leaked, f"owner tasks leaked: {leaked}"

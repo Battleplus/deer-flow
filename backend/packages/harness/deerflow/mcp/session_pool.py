@@ -199,13 +199,34 @@ class MCPSessionPool:
         # routed to their own loop. In every case the owner task — never this
         # one — runs __aexit__. In-flight owners are cancelled (cancel=True) so a
         # blocking initialize() cannot leave them hung.
-        for loop, ent_task, ent_close, cancel in evicted:
-            if loop is current_loop and not loop.is_closed():
-                await self._shutdown(ent_close, ent_task, cancel)
-            elif cancel:
-                await self._shutdown_entry(loop, ent_task, ent_close, cancel=True)
-            else:
-                self._signal_close(loop, ent_close)
+        try:
+            for loop, ent_task, ent_close, cancel in evicted:
+                if loop is current_loop and not loop.is_closed():
+                    await self._shutdown(ent_close, ent_task, cancel)
+                elif cancel:
+                    await self._shutdown_entry(loop, ent_task, ent_close, cancel=True)
+                else:
+                    self._signal_close(loop, ent_close)
+        except BaseException:
+            # Caller cancelled during eviction teardown.  Clean up the
+            # in-flight entry and owner task created in Phase 1 so they
+            # don't leak permanently.
+            if task is not None and not task.done():
+                close_evt.set()
+                task.cancel()
+                try:
+                    await asyncio.shield(task)
+                except BaseException:
+                    logger.debug("Owner task ended during Phase 2 unwind", exc_info=True)
+            with self._lock:
+                if (
+                    ready is not None
+                    and close_evt is not None
+                    and task is not None
+                    and self._inflight.get(key) == (current_loop, ready, task, close_evt)
+                ):
+                    self._inflight.pop(key)
+            raise
 
         # Phase 2b: a concurrent creation for this key is already in progress on
         # this loop — share its result rather than create a duplicate session.
@@ -299,8 +320,15 @@ class MCPSessionPool:
             task.cancel()
         try:
             await task
-        except (Exception, asyncio.CancelledError):
+        except BaseException:
             logger.debug("Owner task ended during shutdown", exc_info=True)
+            # If the task is still running, the exception was the CALLER's
+            # CancelledError propagating through our await — re-raise so the
+            # caller sees its own cancellation.  If the task finished, the
+            # exception was the task's own error/cancellation, which we
+            # suppress (the caller should not see the victim's error).
+            if not task.done():
+                raise
 
     async def _shutdown_entry(
         self,
