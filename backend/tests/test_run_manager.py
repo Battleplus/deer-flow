@@ -1536,3 +1536,28 @@ async def test_failed_create_or_reject_unindexes_run():
         await manager.create_or_reject("thread-a", multitask_strategy="reject")
     assert manager._runs == {}
     assert "thread-a" not in manager._runs_by_thread
+
+
+@pytest.mark.anyio
+async def test_cleanup_after_terminal_evicts_record_and_prunes_thread_index(manager: RunManager):
+    """Cleanup after a terminal run removes the record and prunes the thread index."""
+    record = await manager.create("thread-cleanup")
+    run_id = record.run_id
+
+    # Simulate terminal state.
+    await manager.set_status(run_id, RunStatus.success)
+
+    # Verify the record is still in memory before cleanup.
+    assert await manager.get(run_id) is not None
+    assert "thread-cleanup" in manager._runs_by_thread
+
+    # Cleanup with delay=0 (as scheduled by run_agent after bridge.cleanup).
+    await manager.cleanup(run_id, delay=0)
+
+    # Record should be evicted from both registries.
+    assert await manager.get(run_id) is None
+    assert run_id not in manager._runs
+    assert "thread-cleanup" not in manager._runs_by_thread
+
+    # Thread index bucket should be pruned.
+    assert await manager.list_by_thread("thread-cleanup") == []

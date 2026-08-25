@@ -1355,6 +1355,10 @@ async def run_agent(
 
         await bridge.publish_end(run_id)
         asyncio.create_task(bridge.cleanup(run_id, delay=60))
+        # Evict the in-memory RunRecord after a grace period so completed runs
+        # do not accumulate for the lifetime of the Gateway process.  Historical
+        # reads continue through the durable RunStore when configured.
+        asyncio.create_task(run_manager.cleanup(run_id, delay=300))
 
         if deferred_stop_interrupt is not None:
             raise deferred_stop_interrupt
