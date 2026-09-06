@@ -19,6 +19,13 @@ logger = logging.getLogger(__name__)
 
 _DISCORD_MAX_MESSAGE_LEN = 2000
 
+# Outbound cross-loop awaits must stay bounded: a dead client thread leaves
+# its loop stopped-but-unclosed, so scheduling onto it succeeds but the future
+# never resolves. 30s gives a slow-but-alive send (chunk or file upload) room
+# to finish while still releasing the ChannelManager worker instead of
+# wedging it forever (#5226). stop() bounds the same pattern with 10s.
+OUTBOUND_CROSS_LOOP_TIMEOUT_SECONDS = 30.0
+
 
 class DiscordChannel(Channel):
     """Discord bot channel.
@@ -81,6 +88,41 @@ class DiscordChannel(Channel):
         self._discord_loop: asyncio.AbstractEventLoop | None = None
         self._main_loop: asyncio.AbstractEventLoop | None = None
         self._discord_module = None
+
+    @property
+    def is_running(self) -> bool:
+        # A fatal discord.py condition (invalidated token, unrecoverable close)
+        # ends the client thread while ``_running`` stays True, so readiness
+        # polling must check thread aliveness to restart the channel — same
+        # contract as ``FeishuChannel.is_running`` (#5226).
+        if not self._running:
+            return False
+        return self._thread is not None and self._thread.is_alive()
+
+    async def _await_on_client_loop(self, coro, *, what: str) -> Any:
+        """Schedule *coro* on the client loop and bound the cross-loop await.
+
+        Mirrors the bounded ``run_coroutine_threadsafe`` + ``wait_for`` pattern
+        ``stop()`` already uses. Scheduling onto a stopped-but-unclosed loop
+        succeeds while the coroutine never runs, so an unbounded await here
+        would hang the outbound worker forever; fail fast with a RuntimeError
+        instead, turning a dead client into a logged send failure (#5226).
+        """
+        loop = self._discord_loop
+        if loop is None or not loop.is_running():
+            coro.close()
+            raise RuntimeError(f"Discord client loop is not running; cannot {what}")
+        future = asyncio.run_coroutine_threadsafe(coro, loop)
+        try:
+            return await asyncio.wait_for(asyncio.wrap_future(future), timeout=OUTBOUND_CROSS_LOOP_TIMEOUT_SECONDS)
+        except TimeoutError:
+            future.cancel()
+            logger.warning(
+                "[Discord] %s timed out after %ss on the client loop",
+                what,
+                OUTBOUND_CROSS_LOOP_TIMEOUT_SECONDS,
+            )
+            raise
 
     async def start(self) -> None:
         if self._running:
@@ -241,8 +283,7 @@ class DiscordChannel(Channel):
 
     async def send(self, msg: OutboundMessage) -> None:
         # Stop typing indicator once we're sending the response
-        stop_future = asyncio.run_coroutine_threadsafe(self._stop_typing(msg.chat_id, msg.thread_ts), self._discord_loop)
-        await asyncio.wrap_future(stop_future)
+        await self._await_on_client_loop(self._stop_typing(msg.chat_id, msg.thread_ts), what="stop the typing indicator")
 
         target = await self._resolve_target(msg)
         if target is None:
@@ -251,16 +292,20 @@ class DiscordChannel(Channel):
 
         text = msg.text or ""
         for chunk in self._split_text(text):
-            send_future = asyncio.run_coroutine_threadsafe(target.send(chunk), self._discord_loop)
-            await asyncio.wrap_future(send_future)
+            await self._await_on_client_loop(target.send(chunk), what="send message chunk")
 
     async def send_file(self, msg: OutboundMessage, attachment: ResolvedAttachment) -> bool:
-        stop_future = asyncio.run_coroutine_threadsafe(self._stop_typing(msg.chat_id, msg.thread_ts), self._discord_loop)
-        await asyncio.wrap_future(stop_future)
+        stop_future_error: RuntimeError | TimeoutError | None = None
+        try:
+            await self._await_on_client_loop(self._stop_typing(msg.chat_id, msg.thread_ts), what="stop the typing indicator")
+        except (RuntimeError, TimeoutError) as error:
+            # The send below cannot reach a dead client loop either; report the
+            # upload as failed without wedging the worker (#5226).
+            stop_future_error = error
 
         target = await self._resolve_target(msg)
         if target is None:
-            logger.error("[Discord] target not found for file upload chat_id=%s thread_ts=%s", msg.chat_id, msg.thread_ts)
+            logger.error("[Discord] target not found for chat_id=%s thread_ts=%s", msg.chat_id, msg.thread_ts)
             return False
 
         if self._discord_module is None:
@@ -274,11 +319,12 @@ class DiscordChannel(Channel):
             # success and failure paths.
             data = await asyncio.to_thread(self._read_attachment_bytes, str(attachment.actual_path))
             file = self._discord_module.File(io.BytesIO(data), filename=attachment.filename)
-            send_future = asyncio.run_coroutine_threadsafe(target.send(file=file), self._discord_loop)
-            await asyncio.wrap_future(send_future)
+            await self._await_on_client_loop(target.send(file=file), what="send file")
             logger.info("[Discord] file uploaded: %s", attachment.filename)
             return True
         except Exception:
+            if stop_future_error is not None:
+                logger.warning("[Discord] typing-indicator stop already failed: %s", stop_future_error)
             logger.exception("[Discord] failed to upload file: %s", attachment.filename)
             return False
 
@@ -773,9 +819,8 @@ class DiscordChannel(Channel):
         except (TypeError, ValueError):
             return None
 
-        get_future = asyncio.run_coroutine_threadsafe(self._fetch_channel(target_id), self._discord_loop)
         try:
-            return await asyncio.wrap_future(get_future)
+            return await self._await_on_client_loop(self._fetch_channel(target_id), what=f"resolve target id={raw_id}")
         except Exception:
             logger.exception("[Discord] failed to resolve target id=%s", raw_id)
             return None
