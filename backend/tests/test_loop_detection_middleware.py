@@ -1496,3 +1496,91 @@ class TestFromConfig:
         result = mw._apply(_make_state(tool_calls=[_bash_call(f"cmd_{hard}")]), runtime)
         assert result is not None
         assert mw.consume_stop_reason("test-run") == "loop_capped"
+
+
+class TestBatchScanHardStopPrecedence:
+    """#5243: the full requested tool-call batch must be scanned before a
+    soft warning can short-circuit the remaining hard-limit checks."""
+
+    def test_frequency_hard_stop_not_masked_by_earlier_warning_in_batch(self):
+        """A batch crossing the hard limit must hard-stop even though an
+        earlier call in the same batch hit the warn threshold first.
+
+        Pre-fix: the 2nd call fired the soft warning and returned, leaving all
+        three tool calls intact and executable (the issue's exact repro)."""
+        mw = LoopDetectionMiddleware(tool_freq_warn=2, tool_freq_hard_limit=3)
+        runtime = _make_runtime()
+        state = _make_state(
+            tool_calls=[
+                {"name": "read_file", "id": "c1", "args": {"path": "/a"}},
+                {"name": "read_file", "id": "c2", "args": {"path": "/b"}},
+                {"name": "read_file", "id": "c3", "args": {"path": "/c"}},
+            ]
+        )
+
+        result = mw._apply(state, runtime)
+
+        assert runtime.context["stop_reason"] == "loop_capped"
+        assert result is not None and "messages" in result
+        stripped = result["messages"][0]
+        assert stripped.tool_calls == []
+
+    def test_hash_warning_does_not_skip_frequency_hard_stop_in_batch(self):
+        """An identical-call-set warning must not mask a frequency hard stop
+        later in the same batch."""
+        mw = LoopDetectionMiddleware(warn_threshold=3, hard_limit=10, tool_freq_warn=8, tool_freq_hard_limit=11)
+        runtime = _make_runtime()
+        batch = [{"name": "read_file", "id": f"c{i}", "args": {"path": f"/f{i}"}} for i in range(4)]
+
+        # Two prior identical batches build the hash count to the warn
+        # threshold (3) while the frequency stays below its hard limit (11).
+        for _ in range(2):
+            assert mw._apply(_make_state(tool_calls=copy.deepcopy(batch)), runtime) is None
+
+        # Third identical batch: the hash warning candidate fires, and the
+        # frequency hard limit (cumulative call 11) is crossed later in the
+        # same batch. The hard stop must win.
+        third = _make_state(tool_calls=copy.deepcopy(batch))
+        result = mw._apply(third, runtime)
+
+        assert runtime.context["stop_reason"] == "loop_capped"
+        assert result is not None and "messages" in result
+        stripped = result["messages"][0]
+        assert stripped.tool_calls == []
+        assert "read_file called 11 times" in str(stripped.content)
+
+    def test_warning_only_batch_accounts_every_call_and_marks_only_selected(self):
+        """Warning-only batches keep accounting every requested call, and only
+        the selected warning's emitted-marker is set."""
+        mw = LoopDetectionMiddleware(tool_freq_warn=2, tool_freq_hard_limit=99)
+        runtime = _make_runtime()
+        tid = "test-thread"
+
+        batch = _make_state(
+            tool_calls=[
+                {"name": "read_file", "id": "a1", "args": {"path": "/a1"}},
+                {"name": "read_file", "id": "a2", "args": {"path": "/a2"}},
+                {"name": "write_file", "id": "b1", "args": {"path": "/b1"}},
+                {"name": "write_file", "id": "b2", "args": {"path": "/b2"}},
+            ]
+        )
+
+        assert mw._apply(batch, runtime) is None
+        # The first candidate (read_file) is the selected warning.
+        queued = mw._pending_warnings[_pending_key()]
+        assert queued and "read_file" in queued[0]
+        # Only the selected warning is marked as emitted; write_file's warning
+        # was not selected, so it is not marked and stays deliverable.
+        assert mw._tool_freq_warned[tid] == {"read_file"}
+
+        # A later batch must still warn for write_file — its earlier warning
+        # was accounted for, not lost to the short-circuit.
+        second = _make_state(
+            tool_calls=[
+                {"name": "write_file", "id": "b3", "args": {"path": "/b3"}},
+            ]
+        )
+        assert mw._apply(second, runtime) is None
+        queued_after = mw._pending_warnings[_pending_key()]
+        assert queued_after and "write_file" in queued_after[-1]
+        assert mw._tool_freq_warned[tid] == {"read_file", "write_file"}

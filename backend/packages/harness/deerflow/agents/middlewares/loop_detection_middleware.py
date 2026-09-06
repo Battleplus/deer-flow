@@ -488,6 +488,16 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
             count = history.count(call_hash)
             tool_names = [str(tc.get("name") or "?") for tc in tool_calls]
 
+            # Scan the *complete* requested tool-call batch before returning a
+            # warning: a soft warning that returns early would skip the
+            # frequency accounting and hard-limit checks for later calls in
+            # the same AIMessage, letting a batch that crosses a configured
+            # hard limit stay executable (#5243). Hard stops still return
+            # immediately; soft warnings are held as candidates and only
+            # marked as emitted after the full scan, so at most one warning
+            # is selected and its emitted-marker is set exactly once.
+            warning_decision: _LoopDecision | None = None
+
             # --- Layer 1: hash-based (identical call sets) ---
             if count >= self.hard_limit:
                 logger.error(
@@ -511,7 +521,6 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
             if count >= self.warn_threshold:
                 warned = self._warned[thread_id]
                 if call_hash not in warned:
-                    warned.add(call_hash)
                     logger.warning(
                         "Repetitive tool calls detected — injecting warning",
                         extra={
@@ -521,7 +530,7 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
                             "tools": tool_names,
                         },
                     )
-                    return _LoopDecision(
+                    warning_decision = _LoopDecision(
                         message=_WARNING_MSG,
                         action="warn",
                         detection_layer="identical_call_set",
@@ -578,8 +587,7 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
 
                 if freq_count >= eff_warn:
                     freq_warned = self._tool_freq_warned[thread_id]
-                    if name not in freq_warned:
-                        freq_warned.add(name)
+                    if name not in freq_warned and warning_decision is None:
                         logger.warning(
                             "Tool frequency warning — too many calls to same tool type",
                             extra={
@@ -588,7 +596,7 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
                                 "count": freq_count,
                             },
                         )
-                        return _LoopDecision(
+                        warning_decision = _LoopDecision(
                             message=_TOOL_FREQ_WARNING_MSG.format(tool_name=name, count=freq_count),
                             action="warn",
                             detection_layer="tool_frequency",
@@ -600,6 +608,15 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
                     # Windowed count decayed below the warn threshold; allow a
                     # future burst of this tool to warn again.
                     self._tool_freq_warned[thread_id].discard(name)
+
+            if warning_decision is not None:
+                # Mark only the selected warning as emitted, after every call
+                # in the batch has been accounted for and checked.
+                if warning_decision.detection_layer == "identical_call_set":
+                    self._warned[thread_id].add(call_hash)
+                else:
+                    self._tool_freq_warned[thread_id].add(warning_decision.tool_names[0])
+                return warning_decision
 
         return None
 
