@@ -433,3 +433,154 @@ async def test_stop_wiring_drains_ack_tasks_across_loops() -> None:
         assert not channel._ack_reaction_tasks
     finally:
         _stop_bg_loop(bg_loop, bg_thread)
+
+
+# ---------------------------------------------------------------------------
+# Outbound cross-loop guards (#5226)
+# ---------------------------------------------------------------------------
+
+
+def test_is_running_reflects_client_thread_aliveness() -> None:
+    """``is_running`` must report a dead client thread so readiness restarts it."""
+    bus = MessageBus()
+    channel = DiscordChannel(bus=bus, config={"bot_token": "token"})
+
+    channel._running = True
+    channel._thread = None
+    assert channel.is_running is False
+
+    channel._thread = threading.current_thread()
+    assert channel.is_running is True
+
+    finished = threading.Thread(target=lambda: None)
+    finished.start()
+    finished.join()
+    channel._thread = finished
+    assert channel.is_running is False
+
+    channel._running = False
+    channel._thread = threading.current_thread()
+    assert channel.is_running is False
+
+
+@pytest.mark.asyncio
+async def test_send_fails_fast_when_client_loop_is_missing() -> None:
+    """A dead client must turn into a raised error, not a hung worker (#5226)."""
+    bus = MessageBus()
+    channel = DiscordChannel(bus=bus, config={"bot_token": "token"})
+    channel._running = True
+    channel._discord_loop = None
+    channel._client = None
+
+    msg = OutboundMessage(channel_name="discord", chat_id="c1", thread_id="t1", text="hi")
+    with pytest.raises(RuntimeError, match="Discord client loop is not running"):
+        await channel.send(msg)
+
+
+@pytest.mark.asyncio
+async def test_send_fails_fast_when_client_loop_stopped_but_unclosed() -> None:
+    """The fatal-condition state: loop object exists but its thread is gone."""
+    bus = MessageBus()
+    channel = DiscordChannel(bus=bus, config={"bot_token": "token"})
+    channel._running = True
+
+    stopped_loop = asyncio.new_event_loop()
+    try:
+        channel._discord_loop = stopped_loop  # never running
+
+        msg = OutboundMessage(channel_name="discord", chat_id="c1", thread_id="t1", text="hi")
+        with pytest.raises(RuntimeError, match="Discord client loop is not running"):
+            await channel.send(msg)
+    finally:
+        stopped_loop.close()
+
+
+@pytest.mark.asyncio
+async def test_send_times_out_and_cancels_when_client_loop_never_runs(monkeypatch) -> None:
+    """Even when scheduling succeeds, the await must stay bounded (#5226)."""
+    import concurrent.futures
+
+    import app.channels.discord as discord_module
+
+    monkeypatch.setattr(discord_module, "OUTBOUND_CROSS_LOOP_TIMEOUT_SECONDS", 0.05)
+
+    never_resolving = concurrent.futures.Future()
+    scheduled = []
+
+    def fake_run_coroutine_threadsafe(coro, loop):
+        scheduled.append(coro)
+        return never_resolving
+
+    monkeypatch.setattr(discord_module.asyncio, "run_coroutine_threadsafe", fake_run_coroutine_threadsafe)
+
+    class _FakeRunningLoop:
+        def is_running(self) -> bool:
+            return True
+
+    bus = MessageBus()
+    channel = DiscordChannel(bus=bus, config={"bot_token": "token"})
+    channel._running = True
+    channel._discord_loop = _FakeRunningLoop()
+
+    msg = OutboundMessage(channel_name="discord", chat_id="c1", thread_id="t1", text="hi")
+    with pytest.raises(TimeoutError):
+        await channel.send(msg)
+
+    assert scheduled, "the coroutine must be scheduled before the timeout fires"
+    assert never_resolving.cancelled() or never_resolving.done() is False
+
+
+@pytest.mark.asyncio
+async def test_send_file_returns_false_when_client_loop_is_missing(tmp_path) -> None:
+    bus = MessageBus()
+    channel = DiscordChannel(bus=bus, config={"bot_token": "token"})
+    channel._running = True
+    channel._discord_loop = None
+    channel._client = None
+
+    path = tmp_path / "upload.txt"
+    path.write_bytes(b"hello")
+    att = ResolvedAttachment("/mnt/user-data/outputs/upload.txt", path, "upload.txt", "text/plain", 5, False)
+    msg = OutboundMessage(channel_name="discord", chat_id="c1", thread_id="t1", text="t")
+
+    assert await channel.send_file(msg, att) is False
+
+
+@pytest.mark.asyncio
+async def test_send_still_delivers_on_live_client_loop() -> None:
+    """Happy path through a real client loop stays intact after the guards."""
+    bg_loop, bg_thread = _start_bg_loop()
+    try:
+        channel = _build_send_file_channel(bg_loop)
+        delivered = []
+
+        async def _fake_send(chunk: str) -> None:
+            delivered.append(chunk)
+
+        target = SimpleNamespace(send=_fake_send)
+        channel._client = SimpleNamespace(get_channel=lambda channel_id: target if str(channel_id) == "456" else None)
+        channel._running = True
+        channel._thread = threading.current_thread()
+        assert channel.is_running is True
+
+        msg = OutboundMessage(channel_name="discord", chat_id="456", thread_id="t1", text="chunk-one chunk-two")
+        await channel.send(msg)
+
+        assert delivered == ["chunk-one chunk-two"]
+    finally:
+        _stop_bg_loop(bg_loop, bg_thread)
+
+
+@pytest.mark.asyncio
+async def test_get_channel_or_thread_returns_none_when_loop_dead() -> None:
+    bus = MessageBus()
+    channel = DiscordChannel(bus=bus, config={"bot_token": "token"})
+    channel._running = True
+    channel._client = SimpleNamespace()
+
+    stopped_loop = asyncio.new_event_loop()
+    try:
+        channel._discord_loop = stopped_loop
+        assert await channel._get_channel_or_thread("456") is None
+    finally:
+        stopped_loop.close()
