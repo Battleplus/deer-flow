@@ -23,6 +23,7 @@ from app.channels import buzz_run_policy as _buzz_run_policy  # noqa: F401
 from app.channels import feishu_run_policy as _feishu_run_policy  # noqa: F401
 from app.channels.commands import KNOWN_CHANNEL_COMMANDS
 from app.channels.dedupe_store import InboundDedupeStore, MemoryInboundDedupeStore
+from app.channels.inbound_media import download_inbound_media
 from app.channels.message_bus import (
     INBOUND_FILE_CONTENT_KEY,
     PENDING_CLARIFICATION_METADATA_KEY,
@@ -163,9 +164,13 @@ async def _read_http_inbound_file(file_info: dict[str, Any], client: httpx.Async
     if not isinstance(url, str) or not url:
         return None
 
-    resp = await client.get(url)
-    resp.raise_for_status()
-    return resp.content
+    # The URL arrives inside the relayed platform frame, so it is treated as
+    # untrusted: validate the scheme and stream with an in-flight byte cap
+    # instead of buffering the whole response before any size check (#5223).
+    # Host pinning stays opt-in via download_inbound_media(allowed_hosts=...):
+    # the WeCom platform media domain is not part of the channel config, so a
+    # default allowlist here would risk breaking legitimate flows.
+    return await download_inbound_media(client, url)
 
 
 async def _read_wecom_inbound_file(file_info: dict[str, Any], client: httpx.AsyncClient) -> bytes | None:
