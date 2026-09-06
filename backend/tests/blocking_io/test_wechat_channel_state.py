@@ -71,7 +71,7 @@ async def test_wechat_inbound_file_staging_does_not_block_event_loop(tmp_path: P
     aes_key = b"1234567890abcdef"
     encrypted = _encrypt_aes_128_ecb(plaintext, aes_key)
 
-    async def _fake_download(_url: str, *, timeout: float | None = None):
+    async def _fake_download(_url: str, *, timeout: float | None = None, **_kwargs):
         return encrypted
 
     channel._download_cdn_bytes = _fake_download  # type: ignore[method-assign]

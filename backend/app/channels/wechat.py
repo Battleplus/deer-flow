@@ -17,7 +17,7 @@ from collections.abc import Mapping
 from enum import IntEnum
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import httpx
 from cryptography.hazmat.primitives import padding
@@ -26,6 +26,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from app.channels.base import Channel
 from app.channels.commands import is_known_channel_command
 from app.channels.connection_identity import attach_connection_identity
+from app.channels.inbound_media import download_inbound_media
 from app.channels.message_bus import InboundMessage, InboundMessageType, MessageBus, OutboundMessage, ResolvedAttachment
 
 logger = logging.getLogger(__name__)
@@ -110,6 +111,16 @@ def _safe_media_filename(prefix: str, extension: str, message_id: str | None = N
 
 def _build_cdn_upload_url(cdn_base_url: str, upload_param: str, filekey: str) -> str:
     return f"{cdn_base_url.rstrip('/')}/upload?encrypted_query_param={quote(upload_param, safe='')}&filekey={quote(filekey, safe='')}"
+
+
+def _url_hostname(url: str) -> str | None:
+    hostname = urlparse(url).hostname
+    return hostname.strip().lower() if hostname and hostname.strip() else None
+
+
+def _default_media_hosts(*urls: str) -> frozenset[str]:
+    """Hostnames of the platform endpoints inbound media may be fetched from."""
+    return frozenset({host for host in (_url_hostname(url) for url in urls) if host})
 
 
 def _encode_outbound_media_aes_key(aes_key: bytes) -> str:
@@ -242,6 +253,10 @@ class WechatChannel(Channel):
         self._max_outbound_image_bytes = self._coerce_int(config.get("max_outbound_image_bytes"), self.DEFAULT_MAX_OUTBOUND_IMAGE_BYTES)
         self._max_inbound_file_bytes = self._coerce_int(config.get("max_inbound_file_bytes"), self.DEFAULT_MAX_INBOUND_FILE_BYTES)
         self._max_outbound_file_bytes = self._coerce_int(config.get("max_outbound_file_bytes"), self.DEFAULT_MAX_OUTBOUND_FILE_BYTES)
+        # full_url 来自中转的消息负载,按不可信输入对待:下载目标默认钉在本渠道
+        # 的平台域名(CDN + API base)上,可用 allowed_media_hosts 显式覆盖。
+        configured_media_hosts = self._coerce_plain_str_set(config.get("allowed_media_hosts"))
+        self._allowed_media_hosts = configured_media_hosts or _default_media_hosts(self._cdn_base_url, self._base_url)
         self._allowed_file_extensions = self._coerce_str_set(config.get("allowed_file_extensions"), self.DEFAULT_ALLOWED_FILE_EXTENSIONS)
         self._allowed_users: set[str] = {str(uid).strip() for uid in config.get("allowed_users", []) if str(uid).strip()}
         self._bot_token = str(config.get("bot_token") or "").strip()
@@ -952,11 +967,22 @@ class WechatChannel(Channel):
             payload["no_need_thumb"] = True
         return payload
 
-    async def _download_cdn_bytes(self, url: str, *, timeout: float | None = None) -> bytes:
+    async def _download_cdn_bytes(self, url: str, *, timeout: float | None = None, max_bytes: int = 0) -> bytes | None:
+        """Fetch CDN media, streaming with an in-flight cap instead of buffering.
+
+        ``max_bytes`` bounds the *encrypted* transfer (AES-128-ECB padding adds
+        at most one block over the plaintext limit); ``max_bytes <= 0`` means
+        uncapped. Returns ``None`` when the URL fails destination validation
+        (scheme + platform host allowlist) or the response exceeds the cap.
+        """
         client = await self._ensure_client()
-        response = await client.get(url, timeout=timeout or self.DEFAULT_CDN_TIMEOUT)
-        response.raise_for_status()
-        return response.content
+        return await download_inbound_media(
+            client,
+            url,
+            max_bytes=max_bytes,
+            timeout=timeout or self.DEFAULT_CDN_TIMEOUT,
+            allowed_hosts=self._allowed_media_hosts,
+        )
 
     async def _upload_cdn_bytes(
         self,
@@ -1071,7 +1097,16 @@ class WechatChannel(Channel):
             )
             return None
 
-        encrypted = await self._download_cdn_bytes(full_url)
+        # Cap the encrypted transfer so an oversized attachment is refused
+        # before it is buffered, not after download + decryption; the exact
+        # plaintext check below stays authoritative.
+        encrypted = await self._download_cdn_bytes(
+            full_url,
+            max_bytes=_encrypted_size_for_aes_128_ecb(self._max_inbound_image_bytes) if self._max_inbound_image_bytes > 0 else 0,
+        )
+        if encrypted is None:
+            logger.warning("[WeChat] inbound image download rejected (invalid URL or over limit), skipping message_id=%s", message_id)
+            return None
         decrypted = _decrypt_aes_128_ecb(encrypted, aes_key)
         if self._max_inbound_image_bytes > 0 and len(decrypted) > self._max_inbound_image_bytes:
             logger.warning("[WeChat] inbound image exceeds size limit (%d bytes), skipping message_id=%s", len(decrypted), message_id)
@@ -1125,7 +1160,13 @@ class WechatChannel(Channel):
             logger.warning("[WeChat] inbound file type blocked, skipping message_id=%s filename=%s", message_id, filename)
             return None
 
-        encrypted = await self._download_cdn_bytes(full_url)
+        encrypted = await self._download_cdn_bytes(
+            full_url,
+            max_bytes=_encrypted_size_for_aes_128_ecb(self._max_inbound_file_bytes) if self._max_inbound_file_bytes > 0 else 0,
+        )
+        if encrypted is None:
+            logger.warning("[WeChat] inbound file download rejected (invalid URL or over limit), skipping message_id=%s", message_id)
+            return None
         decrypted = _decrypt_aes_128_ecb(encrypted, aes_key)
         if self._max_inbound_file_bytes > 0 and len(decrypted) > self._max_inbound_file_bytes:
             logger.warning("[WeChat] inbound file exceeds size limit (%d bytes), skipping message_id=%s", len(decrypted), message_id)
@@ -1477,3 +1518,10 @@ class WechatChannel(Channel):
             return set(default)
         normalized = {str(item).strip().lower() if str(item).strip().startswith(".") else f".{str(item).strip().lower()}" for item in value if str(item).strip()}
         return normalized or set(default)
+
+    @staticmethod
+    def _coerce_plain_str_set(value: Any) -> frozenset[str]:
+        """Coerce a config list to a lowercase string set without the extension-dot rule."""
+        if not isinstance(value, (list, tuple, set, frozenset)):
+            return frozenset()
+        return frozenset({str(item).strip().lower() for item in value if str(item).strip()})
