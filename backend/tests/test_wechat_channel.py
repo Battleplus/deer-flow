@@ -164,7 +164,7 @@ def test_handle_update_downloads_inbound_image(monkeypatch, tmp_path: Path):
         channel = WechatChannel(bus=bus, config={"bot_token": "test-token", "state_dir": str(tmp_path)})
         encrypted = channel.__class__.__dict__["_extract_image_file"].__globals__["_encrypt_aes_128_ecb"](plaintext, aes_key)
 
-        async def _fake_download(_url: str, *, timeout: float | None = None):
+        async def _fake_download(_url: str, *, timeout: float | None = None, **_kwargs):
             return encrypted
 
         channel._download_cdn_bytes = _fake_download  # type: ignore[method-assign]
@@ -219,7 +219,7 @@ def test_handle_update_downloads_inbound_png_with_png_extension(monkeypatch, tmp
         channel = WechatChannel(bus=bus, config={"bot_token": "test-token", "state_dir": str(tmp_path)})
         encrypted = channel.__class__.__dict__["_extract_image_file"].__globals__["_encrypt_aes_128_ecb"](plaintext, aes_key)
 
-        async def _fake_download(_url: str, *, timeout: float | None = None):
+        async def _fake_download(_url: str, *, timeout: float | None = None, **_kwargs):
             return encrypted
 
         channel._download_cdn_bytes = _fake_download  # type: ignore[method-assign]
@@ -267,7 +267,7 @@ def test_handle_update_preserves_text_and_ref_msg_with_image(monkeypatch, tmp_pa
         channel = WechatChannel(bus=bus, config={"bot_token": "test-token", "state_dir": str(tmp_path)})
         encrypted = channel.__class__.__dict__["_extract_image_file"].__globals__["_encrypt_aes_128_ecb"](plaintext, aes_key)
 
-        async def _fake_download(_url: str, *, timeout: float | None = None):
+        async def _fake_download(_url: str, *, timeout: float | None = None, **_kwargs):
             return encrypted
 
         channel._download_cdn_bytes = _fake_download  # type: ignore[method-assign]
@@ -980,7 +980,7 @@ def test_handle_update_downloads_inbound_file(monkeypatch, tmp_path: Path):
         channel = WechatChannel(bus=bus, config={"bot_token": "test-token", "state_dir": str(tmp_path)})
         encrypted = channel.__class__.__dict__["_extract_file_item"].__globals__["_encrypt_aes_128_ecb"](plaintext, aes_key)
 
-        async def _fake_download(_url: str, *, timeout: float | None = None):
+        async def _fake_download(_url: str, *, timeout: float | None = None, **_kwargs):
             return encrypted
 
         channel._download_cdn_bytes = _fake_download  # type: ignore[method-assign]
@@ -1035,7 +1035,7 @@ def test_handle_update_downloads_inbound_file_with_media_aeskey_hex(monkeypatch,
         channel = WechatChannel(bus=bus, config={"bot_token": "test-token", "state_dir": str(tmp_path)})
         encrypted = channel.__class__.__dict__["_extract_file_item"].__globals__["_encrypt_aes_128_ecb"](plaintext, aes_key)
 
-        async def _fake_download(_url: str, *, timeout: float | None = None):
+        async def _fake_download(_url: str, *, timeout: float | None = None, **_kwargs):
             return encrypted
 
         channel._download_cdn_bytes = _fake_download  # type: ignore[method-assign]
@@ -1086,7 +1086,7 @@ def test_handle_update_downloads_inbound_file_with_unpadded_item_aes_key(monkeyp
         channel = WechatChannel(bus=bus, config={"bot_token": "test-token", "state_dir": str(tmp_path)})
         encrypted = channel.__class__.__dict__["_extract_file_item"].__globals__["_encrypt_aes_128_ecb"](plaintext, aes_key)
 
-        async def _fake_download(_url: str, *, timeout: float | None = None):
+        async def _fake_download(_url: str, *, timeout: float | None = None, **_kwargs):
             return encrypted
 
         channel._download_cdn_bytes = _fake_download  # type: ignore[method-assign]
@@ -1135,7 +1135,7 @@ def test_handle_update_downloads_inbound_file_with_media_aes_key_base64_of_hex(m
         channel = WechatChannel(bus=bus, config={"bot_token": "test-token", "state_dir": str(tmp_path)})
         encrypted = channel.__class__.__dict__["_extract_file_item"].__globals__["_encrypt_aes_128_ecb"](plaintext, aes_key)
 
-        async def _fake_download(_url: str, *, timeout: float | None = None):
+        async def _fake_download(_url: str, *, timeout: float | None = None, **_kwargs):
             return encrypted
 
         channel._download_cdn_bytes = _fake_download  # type: ignore[method-assign]
@@ -1185,7 +1185,7 @@ def test_handle_update_skips_disallowed_inbound_file(monkeypatch, tmp_path: Path
         channel = WechatChannel(bus=bus, config={"bot_token": "test-token", "state_dir": str(tmp_path)})
         encrypted = channel.__class__.__dict__["_extract_file_item"].__globals__["_encrypt_aes_128_ecb"](plaintext, aes_key)
 
-        async def _fake_download(_url: str, *, timeout: float | None = None):
+        async def _fake_download(_url: str, *, timeout: float | None = None, **_kwargs):
             return encrypted
 
         channel._download_cdn_bytes = _fake_download  # type: ignore[method-assign]
@@ -1351,7 +1351,7 @@ def test_poll_loop_one_bad_message_does_not_permanently_lose_its_siblings(monkey
             config={"bot_token": "test-token", "state_dir": str(state_dir), "polling_retry_delay": 0.001},
         )
 
-        async def _fake_download(_url: str, *, timeout: float | None = None) -> bytes:
+        async def _fake_download(_url: str, *, timeout: float | None = None, **_kwargs) -> bytes:
             return non_block_aligned_ciphertext
 
         channel._download_cdn_bytes = _fake_download  # type: ignore[method-assign]
