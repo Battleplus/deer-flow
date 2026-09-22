@@ -2865,6 +2865,155 @@ class TestCooperativeCancellation:
         assert result.error == "Cancelled by user"
         assert result.completed_at is not None
 
+    @staticmethod
+    def _close_tracking_stream(chunks, on_iteration_start=None):
+        """Build an async stream whose ``aclose()`` records teardown (#5218)."""
+
+        class CloseTrackingStream:
+            def __init__(self, chunks, on_iteration_start):
+                self._chunks = list(chunks)
+                self._on_iteration_start = on_iteration_start
+                self._next_index = 0
+                self.closed = False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if self._next_index == 0 and self._on_iteration_start is not None:
+                    self._on_iteration_start()
+                if self._next_index >= len(self._chunks):
+                    raise StopAsyncIteration
+                chunk = self._chunks[self._next_index]
+                self._next_index += 1
+                return chunk
+
+            async def aclose(self):
+                self.closed = True
+
+        return CloseTrackingStream(chunks, on_iteration_start)
+
+    @pytest.mark.anyio
+    async def test_aexecute_cancelled_mid_stream_closes_graph_stream(self, classes, base_config, msg):
+        """Teardown: cooperative cancellation closes the active graph stream before returning."""
+        SubagentExecutor = classes["SubagentExecutor"]
+        SubagentResult = classes["SubagentResult"]
+        SubagentStatus = classes["SubagentStatus"]
+
+        cancel_event = threading.Event()
+        stream = self._close_tracking_stream(
+            [
+                {"messages": [msg.human("Task"), msg.ai("Partial", "msg-1")]},
+                {"messages": [msg.human("Task"), msg.ai("Should not appear", "msg-2")]},
+            ],
+            on_iteration_start=cancel_event.set,
+        )
+
+        mock_agent = MagicMock()
+        mock_agent.astream = lambda *args, **kwargs: stream
+
+        result_holder = SubagentResult(
+            task_id="cancel-mid-close",
+            trace_id="test-trace",
+            status=SubagentStatus.RUNNING,
+            started_at=datetime.now(),
+        )
+        result_holder.cancel_event = cancel_event
+
+        executor = SubagentExecutor(
+            config=base_config,
+            tools=[],
+            thread_id="test-thread",
+        )
+
+        with patch.object(executor, "_create_agent", return_value=mock_agent):
+            result = await executor._aexecute("Task", result_holder=result_holder)
+
+        assert result.status == SubagentStatus.CANCELLED
+        assert result.error == "Cancelled by user"
+        # The stream must be closed before the terminal result becomes observable
+        # and the outer finally releases the sandbox lease / task-stop notification.
+        assert stream.closed is True
+
+    @pytest.mark.anyio
+    async def test_aexecute_closes_graph_stream_on_completion(self, classes, base_config, msg):
+        """Teardown: the graph stream is closed on the normal completion path too."""
+        SubagentExecutor = classes["SubagentExecutor"]
+        SubagentResult = classes["SubagentResult"]
+        SubagentStatus = classes["SubagentStatus"]
+
+        stream = self._close_tracking_stream(
+            [{"messages": [msg.human("Task"), msg.ai("Done", "msg-1")]}],
+        )
+
+        mock_agent = MagicMock()
+        mock_agent.astream = lambda *args, **kwargs: stream
+
+        result_holder = SubagentResult(
+            task_id="complete-close",
+            trace_id="test-trace",
+            status=SubagentStatus.RUNNING,
+            started_at=datetime.now(),
+        )
+
+        executor = SubagentExecutor(
+            config=base_config,
+            tools=[],
+            thread_id="test-thread",
+        )
+
+        with patch.object(executor, "_create_agent", return_value=mock_agent):
+            result = await executor._aexecute("Task", result_holder=result_holder)
+
+        assert result.status == SubagentStatus.COMPLETED
+        assert stream.closed is True
+
+    @pytest.mark.anyio
+    async def test_aexecute_closes_graph_stream_on_error_and_preserves_primary_error(self, classes, base_config, msg):
+        """Teardown: graph errors still close the stream, and a close failure must not mask them."""
+        SubagentExecutor = classes["SubagentExecutor"]
+        SubagentResult = classes["SubagentResult"]
+        SubagentStatus = classes["SubagentStatus"]
+
+        class FailingCloseStream:
+            def __init__(self):
+                self.closed = False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise RuntimeError("graph exploded")
+
+            async def aclose(self):
+                self.closed = True
+                raise RuntimeError("close failed")
+
+        stream = FailingCloseStream()
+
+        mock_agent = MagicMock()
+        mock_agent.astream = lambda *args, **kwargs: stream
+
+        result_holder = SubagentResult(
+            task_id="error-close",
+            trace_id="test-trace",
+            status=SubagentStatus.RUNNING,
+            started_at=datetime.now(),
+        )
+
+        executor = SubagentExecutor(
+            config=base_config,
+            tools=[],
+            thread_id="test-thread",
+        )
+
+        with patch.object(executor, "_create_agent", return_value=mock_agent):
+            result = await executor._aexecute("Task", result_holder=result_holder)
+
+        assert result.status == SubagentStatus.FAILED
+        assert result.error == "graph exploded"
+        assert stream.closed is True
+
     def test_request_cancel_sets_event(self, executor_module, classes):
         """Test that request_cancel_background_task sets the cancel_event."""
         SubagentResult = classes["SubagentResult"]
